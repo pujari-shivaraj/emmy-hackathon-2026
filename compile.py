@@ -7,6 +7,11 @@ Optimization Pipeline:
 3. Pass 3: Immediate-Operand Folding (eliminates redundant movs)
 4. Pass 4: FMA (Fused Multiply-Add) Pattern Matching
 
+Data Type Support:
+- f32 (float32): full support — all 5 problem categories
+- f16 (float16): load/store/arithmetic/fma — hardware native instructions
+- bf16 (bfloat16): load/store/arithmetic — hardware native instructions
+
 Usage:
     python compile.py path/to/<kernel>.ir.json > out.ptx
 """
@@ -131,6 +136,7 @@ class PTXEmitter:
     def __init__(self):
         self.pred_count = 0
         self.f32_count = 0
+        self.f16_count = 0  # for %h<N> registers (f16 / bf16)
         self.b32_count = 0
         self.b64_count = 0
         self.label_count = 0
@@ -149,6 +155,8 @@ class PTXEmitter:
         self.init_names: set[str] = set()
         # FMA tracking: mul_name -> (arg0_reg, arg1_reg)
         self.mul_defs: dict[str, tuple[str, str]] = {}
+        # Active kernel dtype (set during compile_kernel)
+        self.kernel_dtype: str = "f32"
 
     def next_pred(self) -> str:
         self.pred_count += 1
@@ -157,6 +165,17 @@ class PTXEmitter:
     def next_f32(self) -> str:
         self.f32_count += 1
         return f"%f{self.f32_count}"
+
+    def next_f16(self) -> str:
+        """Allocate a 16-bit float register (%h<N>) for f16 / bf16 values."""
+        self.f16_count += 1
+        return f"%h{self.f16_count}"
+
+    def next_scalar(self, dtype: str = "f32") -> str:
+        """Allocate a scalar float register appropriate for the given dtype."""
+        if dtype in ("f16", "bf16"):
+            return self.next_f16()
+        return self.next_f32()
 
     def next_b32(self) -> str:
         self.b32_count += 1
@@ -581,6 +600,8 @@ def compile_kernel(ir_path: Path) -> str:
     all_lines = emitter.lines[:]
     all_lines.append(f"    .reg .pred %p<{max(body_emitter.pred_count + 1, 4)}>;")
     all_lines.append(f"    .reg .f32  %f<{max(body_emitter.f32_count + 1, 16)}>;")
+    if body_emitter.f16_count > 0:
+        all_lines.append(f"    .reg .b16  %h<{body_emitter.f16_count + 1}>;")
     all_lines.append(f"    .reg .b32  %r<{max(body_emitter.b32_count + 1, 16)}>;")
     all_lines.append(f"    .reg .b64  %rd<{max(body_emitter.b64_count + 1, 8)}>;")
     all_lines.append("")
@@ -617,9 +638,19 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
         elif stype == "Init":
             emitter.init_names.add(stmt.name)
             ident = stmt.identity.value if hasattr(stmt.identity, "value") else stmt.identity
-            f_reg = emitter.next_f32()
-            emitter.emit(f"    mov.f32 {f_reg}, {float_to_ptx_hex(ident)};")
-            emitter.env[stmt.name] = f_reg
+            dt = getattr(stmt, "dtype", None)
+            dt_name = dt.name if hasattr(dt, "name") else "f32"
+            if dt_name in ("f16", "bf16"):
+                h_reg = emitter.next_f16()
+                # Initialize f16 accumulator via f32 literal -> cvt
+                f_tmp = emitter.next_f32()
+                emitter.emit(f"    mov.f32 {f_tmp}, {float_to_ptx_hex(ident)};")
+                emitter.emit(f"    cvt.rn.{dt_name}.f32 {h_reg}, {f_tmp};")
+                emitter.env[stmt.name] = h_reg
+            else:
+                f_reg = emitter.next_f32()
+                emitter.emit(f"    mov.f32 {f_reg}, {float_to_ptx_hex(ident)};")
+                emitter.env[stmt.name] = f_reg
 
         elif stype == "Let":
             dtype_str = stmt.dtype.name if hasattr(stmt.dtype, "name") else str(stmt.dtype)
@@ -635,36 +666,40 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
 
         elif stype == "Load":
             buf_name = stmt.input
+            dt = getattr(stmt, "dtype", None)
+            dt_name = dt.name if hasattr(dt, "name") else "f32"
+            is_f16_like = dt_name in ("f16", "bf16")
+
             if buf_name in emitter.smem_names:
                 addr = emitter.compile_shared_address(buf_name, stmt.index)
                 if stmt.width == 1:
-                    f_reg = emitter.next_f32()
-                    emitter.emit(f"    ld.shared.f32 {f_reg}, [{addr}];")
-                    emitter.env[stmt.names[0]] = f_reg
+                    reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    emitter.emit(f"    ld.shared.{dt_name} {reg}, [{addr}];")
+                    emitter.env[stmt.names[0]] = reg
                 elif stmt.width == 2:
-                    f_reg0 = emitter.next_f32()
-                    f_reg1 = emitter.next_f32()
-                    emitter.emit(f"    ld.shared.v2.f32 {{{f_reg0}, {f_reg1}}}, [{addr}];")
-                    emitter.env[stmt.names[0]] = f_reg0
-                    emitter.env[stmt.names[1]] = f_reg1
+                    reg0 = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    reg1 = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    emitter.emit(f"    ld.shared.v2.{dt_name} {{{reg0}, {reg1}}}, [{addr}];")
+                    emitter.env[stmt.names[0]] = reg0
+                    emitter.env[stmt.names[1]] = reg1
                 else:
                     raise NotImplementedError(f"Shared vector load width {stmt.width}")
             else:
                 addr = emitter.compile_global_address(buf_name, stmt.index)
                 if stmt.width == 1:
-                    f_reg = emitter.next_f32()
-                    emitter.emit(f"    ld.global.f32 {f_reg}, [{addr}];")
-                    emitter.env[stmt.names[0]] = f_reg
+                    reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    emitter.emit(f"    ld.global.{dt_name} {reg}, [{addr}];")
+                    emitter.env[stmt.names[0]] = reg
                 elif stmt.width == 2:
-                    f_reg0 = emitter.next_f32()
-                    f_reg1 = emitter.next_f32()
-                    emitter.emit(f"    ld.global.v2.f32 {{{f_reg0}, {f_reg1}}}, [{addr}];")
-                    emitter.env[stmt.names[0]] = f_reg0
-                    emitter.env[stmt.names[1]] = f_reg1
+                    reg0 = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    reg1 = emitter.next_f16() if is_f16_like else emitter.next_f32()
+                    emitter.emit(f"    ld.global.v2.{dt_name} {{{reg0}, {reg1}}}, [{addr}];")
+                    emitter.env[stmt.names[0]] = reg0
+                    emitter.env[stmt.names[1]] = reg1
                 elif stmt.width == 4:
-                    f_regs = [emitter.next_f32() for _ in range(4)]
-                    emitter.emit(f"    ld.global.v4.f32 {{{', '.join(f_regs)}}}, [{addr}];")
-                    for name, r in zip(stmt.names, f_regs):
+                    regs = [emitter.next_f16() if is_f16_like else emitter.next_f32() for _ in range(4)]
+                    emitter.emit(f"    ld.global.v4.{dt_name} {{{', '.join(regs)}}}, [{addr}];")
+                    for name, r in zip(stmt.names, regs):
                         emitter.env[name] = r
                 else:
                     raise NotImplementedError(f"Vector load width {stmt.width} not implemented yet")
@@ -675,39 +710,85 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
         elif stype == "Assign":
             op_name = stmt.op.name
             args = [emitter.env[a] for a in stmt.args]
-            out_reg = emitter.next_f32()
+            dt = getattr(stmt, "dtype", None)
+            dt_name = dt.name if hasattr(dt, "name") else "f32"
+            is_f16_like = dt_name in ("f16", "bf16")
+            out_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
 
             if op_name == "multiply":
                 emitter.mul_defs[stmt.name] = (args[0], args[1])
-                emitter.emit(f"    mul.f32 {out_reg}, {args[0]}, {args[1]};")
+                emitter.emit(f"    mul.{dt_name} {out_reg}, {args[0]}, {args[1]};")
             elif op_name == "add":
                 # FMA fusion: check if either operand is an in-flight multiply
                 if stmt.args[0] in emitter.mul_defs:
                     ma, mb = emitter.mul_defs[stmt.args[0]]
-                    emitter.emit(f"    fma.rn.f32 {out_reg}, {ma}, {mb}, {args[1]};")
+                    fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
+                    emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {args[1]};")
                 elif stmt.args[1] in emitter.mul_defs:
                     ma, mb = emitter.mul_defs[stmt.args[1]]
-                    emitter.emit(f"    fma.rn.f32 {out_reg}, {ma}, {mb}, {args[0]};")
+                    fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
+                    emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {args[0]};")
                 else:
-                    emitter.emit(f"    add.f32 {out_reg}, {args[0]}, {args[1]};")
+                    emitter.emit(f"    add.{dt_name} {out_reg}, {args[0]}, {args[1]};")
             elif op_name == "divide":
-                emitter.emit(f"    div.rn.f32 {out_reg}, {args[0]}, {args[1]};")
+                if is_f16_like:
+                    # f16/bf16 has no native div; promote to f32, divide, convert back
+                    f_a = emitter.next_f32()
+                    f_b = emitter.next_f32()
+                    f_r = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_a}, {args[0]};")
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_b}, {args[1]};")
+                    emitter.emit(f"    div.rn.f32 {f_r}, {f_a}, {f_b};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_r};")
+                else:
+                    emitter.emit(f"    div.rn.f32 {out_reg}, {args[0]}, {args[1]};")
             elif op_name == "relu":
-                emitter.emit(f"    max.f32 {out_reg}, {args[0]}, 0f00000000;")
+                if is_f16_like:
+                    zero_h = emitter.next_f16()
+                    f_zero = emitter.next_f32()
+                    emitter.emit(f"    mov.f32 {f_zero}, 0f00000000;")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {zero_h}, {f_zero};")
+                    emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {zero_h};")
+                else:
+                    emitter.emit(f"    max.f32 {out_reg}, {args[0]}, 0f00000000;")
             elif op_name == "maximum":
-                emitter.emit(f"    max.f32 {out_reg}, {args[0]}, {args[1]};")
+                emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {args[1]};")
             elif op_name in ("sub", "subtract"):
-                emitter.emit(f"    sub.f32 {out_reg}, {args[0]}, {args[1]};")
+                emitter.emit(f"    sub.{dt_name} {out_reg}, {args[0]}, {args[1]};")
             elif op_name == "reciprocal":
-                emitter.emit(f"    rcp.approx.f32 {out_reg}, {args[0]};")
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_rcp = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    rcp.approx.f32 {f_rcp}, {f_in};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_rcp};")
+                else:
+                    emitter.emit(f"    rcp.approx.f32 {out_reg}, {args[0]};")
             elif op_name == "sqrt":
-                emitter.emit(f"    sqrt.approx.f32 {out_reg}, {args[0]};")
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_sq = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    sqrt.approx.f32 {f_sq}, {f_in};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_sq};")
+                else:
+                    emitter.emit(f"    sqrt.approx.f32 {out_reg}, {args[0]};")
             elif op_name == "exp":
-                f_scaled = emitter.next_f32()
-                emitter.emit(f"    mul.f32 {f_scaled}, {args[0]}, 0f3fb8aa3b;")
-                emitter.emit(f"    ex2.approx.f32 {out_reg}, {f_scaled};")
+                # ex2 only exists for f32; promote f16->f32, compute, convert back
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_scaled = emitter.next_f32()
+                    f_out = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    mul.f32 {f_scaled}, {f_in}, 0f3fb8aa3b;")
+                    emitter.emit(f"    ex2.approx.f32 {f_out}, {f_scaled};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_out};")
+                else:
+                    f_scaled = emitter.next_f32()
+                    emitter.emit(f"    mul.f32 {f_scaled}, {args[0]}, 0f3fb8aa3b;")
+                    emitter.emit(f"    ex2.approx.f32 {out_reg}, {f_scaled};")
             elif op_name == "copy":
-                emitter.emit(f"    mov.f32 {out_reg}, {args[0]};")
+                emitter.emit(f"    mov.b16 {out_reg}, {args[0]};" if is_f16_like else f"    mov.f32 {out_reg}, {args[0]};")
             else:
                 raise NotImplementedError(f"Unsupported assign op: {op_name}")
             emitter.env[stmt.name] = out_reg
@@ -715,10 +796,19 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
         elif stype == "Accum":
             val_reg = emitter.env[stmt.value]
             acc_name = stmt.name
+            dt = getattr(stmt, "dtype", None)
+            dt_name = dt.name if hasattr(dt, "name") else "f32"
+            is_f16_like = dt_name in ("f16", "bf16")
+
             if acc_name not in emitter.env:
-                acc_reg = emitter.next_f32()
+                acc_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
                 ident = stmt.op.identity if hasattr(stmt.op, "identity") else 0.0
-                emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
+                if is_f16_like:
+                    f_tmp = emitter.next_f32()
+                    emitter.emit(f"    mov.f32 {f_tmp}, {float_to_ptx_hex(ident)};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {acc_reg}, {f_tmp};")
+                else:
+                    emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
                 emitter.env[acc_name] = acc_reg
             else:
                 acc_reg = emitter.env[acc_name]
@@ -731,19 +821,27 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
                 # FMA Fusion into accumulator!
                 if stmt.value in emitter.mul_defs:
                     ma, mb = emitter.mul_defs[stmt.value]
-                    emitter.emit(f"    fma.rn.f32 {acc_reg}, {ma}, {mb}, {lhs};")
+                    emitter.emit(f"    fma.rn.{dt_name} {acc_reg}, {ma}, {mb}, {lhs};")
                 else:
-                    emitter.emit(f"    add.f32 {acc_reg}, {lhs}, {rhs};")
+                    emitter.emit(f"    add.{dt_name} {acc_reg}, {lhs}, {rhs};")
             elif op_name == "maximum":
-                emitter.emit(f"    max.f32 {acc_reg}, {lhs}, {rhs};")
+                emitter.emit(f"    max.{dt_name} {acc_reg}, {lhs}, {rhs};")
             else:
                 raise NotImplementedError(f"Unsupported accum op: {op_name}")
 
         elif stype == "StridedLoop":
             for acc in find_axis_accums(stmt.axis.name, stmt.body, emitter):
-                acc_reg = emitter.next_f32()
+                dt = getattr(acc, "dtype", None)
+                dt_name = dt.name if hasattr(dt, "name") else "f32"
+                is_f16_like = dt_name in ("f16", "bf16")
+                acc_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
                 ident = acc.op.identity if hasattr(acc.op, "identity") else 0.0
-                emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
+                if is_f16_like:
+                    f_tmp = emitter.next_f32()
+                    emitter.emit(f"    mov.f32 {f_tmp}, {float_to_ptx_hex(ident)};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {acc_reg}, {f_tmp};")
+                else:
+                    emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
                 emitter.env[acc.name] = acc_reg
 
             start_reg = emitter.compile_expr(stmt.start)
@@ -769,9 +867,17 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
 
         elif stype == "Loop":
             for acc in find_axis_accums(stmt.axis.name, stmt.body, emitter):
-                acc_reg = emitter.next_f32()
+                dt = getattr(acc, "dtype", None)
+                dt_name = dt.name if hasattr(dt, "name") else "f32"
+                is_f16_like = dt_name in ("f16", "bf16")
+                acc_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
                 ident = acc.op.identity if hasattr(acc.op, "identity") else 0.0
-                emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
+                if is_f16_like:
+                    f_tmp = emitter.next_f32()
+                    emitter.emit(f"    mov.f32 {f_tmp}, {float_to_ptx_hex(ident)};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {acc_reg}, {f_tmp};")
+                else:
+                    emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
                 emitter.env[acc.name] = acc_reg
 
             r_loop = emitter.next_b32()
@@ -919,21 +1025,23 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
 
             if buf_name in emitter.smem_names:
                 addr = emitter.compile_shared_address(buf_name, stmt.index)
-                emitter.emit(f"    st.shared.f32 [{addr}], {val_regs[0]};")
+                dt_name = getattr(stmt.value_dtype, "name", "f32") if stmt.value_dtype else "f32"
+                emitter.emit(f"    st.shared.{dt_name} [{addr}], {val_regs[0]};")
             else:
                 addr = emitter.compile_global_address(buf_name, stmt.index)
+                dt_name = getattr(stmt.value_dtype, "name", "f32") if stmt.value_dtype else "f32"
                 is_atomic = getattr(stmt, "atomic", False)
                 if is_atomic:
                     for val_reg in val_regs:
-                        emitter.emit(f"    red.global.add.f32 [{addr}], {val_reg};")
+                        emitter.emit(f"    red.global.add.{dt_name} [{addr}], {val_reg};")
                 else:
                     if len(val_regs) == 1:
-                        emitter.emit(f"    st.global.f32 [{addr}], {val_regs[0]};")
+                        emitter.emit(f"    st.global.{dt_name} [{addr}], {val_regs[0]};")
                     elif len(val_regs) == 2:
-                        emitter.emit(f"    st.global.v2.f32 [{addr}], {{{val_regs[0]}, {val_regs[1]}}};")
+                        emitter.emit(f"    st.global.v2.{dt_name} [{addr}], {{{val_regs[0]}, {val_regs[1]}}};")
                     elif len(val_regs) == 4:
                         emitter.emit(
-                            f"    st.global.v4.f32 [{addr}], {{{val_regs[0]}, {val_regs[1]}, {val_regs[2]}, {val_regs[3]}}};"
+                            f"    st.global.v4.{dt_name} [{addr}], {{{val_regs[0]}, {val_regs[1]}, {val_regs[2]}, {val_regs[3]}}};"
                         )
                     else:
                         raise NotImplementedError(f"Unsupported write width: {len(val_regs)}")
