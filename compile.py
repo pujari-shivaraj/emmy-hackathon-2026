@@ -132,6 +132,40 @@ def simplify_expr(expr):
     return expr
 
 
+def expr_free_vars(expr) -> set[str]:
+    """Collect all variable names referenced in an expression tree."""
+    res = set()
+    if hasattr(expr, "name"):
+        res.add(expr.name)
+    if hasattr(expr, "left"):
+        res.update(expr_free_vars(expr.left))
+    if hasattr(expr, "right"):
+        res.update(expr_free_vars(expr.right))
+    if hasattr(expr, "cond"):
+        res.update(expr_free_vars(expr.cond))
+    if hasattr(expr, "if_true"):
+        res.update(expr_free_vars(expr.if_true))
+    if hasattr(expr, "if_false"):
+        res.update(expr_free_vars(expr.if_false))
+    return res
+
+
+def expr_key(expr) -> str:
+    """Generate a unique canonical key for structural expression hashing."""
+    if isinstance(expr, (int, float)):
+        return str(expr)
+    t = type(expr).__name__
+    if t == "Var":
+        return f"Var({expr.name})"
+    if t in ("Literal", "LiteralWrapper"):
+        return f"Lit({expr.value})"
+    if t in ("BinaryExpr", "BinaryExprWrapper"):
+        return f"Bin({expr.op},{expr_key(expr.left)},{expr_key(expr.right)})"
+    if t == "TernaryExpr":
+        return f"Tern({expr_key(expr.cond)},{expr_key(expr.if_true)},{expr_key(expr.if_false)})"
+    return str(expr)
+
+
 class PTXEmitter:
     def __init__(self):
         self.pred_count = 0
@@ -159,6 +193,10 @@ class PTXEmitter:
         self.kernel_dtype: str = "f32"
         # Fragment register mapping: frag_name -> list of allocated registers
         self.frag_regs: dict[str, list[str]] = {}
+        # Pass 6: Common Subexpression Elimination (CSE) cache
+        self.expr_cache: dict[str, str] = {}
+        # Active loop variables (expressions referencing these are not loop-invariant)
+        self.loop_vars: set[str] = set()
 
     def alloc_frag(self, name: str, role: str, count: int, dtype: str = "f32") -> list[str]:
         """Allocate physical registers for an MMA operand or accumulator fragment."""
@@ -206,11 +244,19 @@ class PTXEmitter:
         self.lines.append(line)
 
     # ==========================================================================
-    # PASS 3: Immediate-Operand Folding
+    # PASS 3 & 6: Immediate Folding & Common Subexpression Elimination (CSE)
     # ==========================================================================
     def compile_expr(self, expr) -> str:
         expr = simplify_expr(expr)
         expr_type = type(expr).__name__
+
+        # Pass 6: Loop-Invariant Common Subexpression Elimination (CSE)
+        is_composite = expr_type in ("BinaryExpr", "BinaryExprWrapper", "TernaryExpr")
+        free = expr_free_vars(expr) if is_composite else None
+        if is_composite and not (free & self.loop_vars):
+            key = expr_key(expr)
+            if key in self.expr_cache:
+                return self.expr_cache[key]
 
         if isinstance(expr, (int, float)):
             if isinstance(expr, float):
@@ -296,6 +342,8 @@ class PTXEmitter:
                 self.emit(f"    selp.b32 {out_reg}, {r_one}, {r_zero}, {p_reg};")
             else:
                 raise NotImplementedError(f"Unsupported binary expr op: {op}")
+            if is_composite and not (free & self.loop_vars):
+                self.expr_cache[key] = out_reg
             return out_reg
 
         elif expr_type == "TernaryExpr":
@@ -304,6 +352,8 @@ class PTXEmitter:
             r_false = self.compile_expr(expr.if_false)
             out_reg = self.next_b32()
             self.emit(f"    selp.b32 {out_reg}, {r_true}, {r_false}, {p_cond};")
+            if is_composite and not (free & self.loop_vars):
+                self.expr_cache[key] = out_reg
             return out_reg
 
         else:
@@ -890,13 +940,16 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
             emitter.emit(f"    setp.ge.s32 {p_loop}, {r_loop}, {extent};")
             emitter.emit(f"    @{p_loop} bra {loop_end};")
 
+            emitter.loop_vars.add(stmt.axis.name)
             compile_stmts(stmt.body, emitter, exit_label)
+            emitter.loop_vars.discard(stmt.axis.name)
 
             emitter.emit(f"    add.s32 {r_loop}, {r_loop}, {step_val};")
             emitter.emit(f"    bra {loop_start};")
             emitter.emit(f"{loop_end}:")
 
         elif stype == "Loop":
+            loop_acc_names = set()
             for acc in find_axis_accums(stmt.axis.name, stmt.body, emitter):
                 dt = getattr(acc, "dtype", None)
                 dt_name = dt.name if hasattr(dt, "name") else "f32"
@@ -910,6 +963,7 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
                 else:
                     emitter.emit(f"    mov.f32 {acc_reg}, {float_to_ptx_hex(ident)};")
                 emitter.env[acc.name] = acc_reg
+                loop_acc_names.add(acc.name)
 
             r_loop = emitter.next_b32()
             emitter.emit(f"    mov.u32 {r_loop}, 0;")
@@ -924,7 +978,11 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
             emitter.emit(f"    setp.ge.s32 {p_loop}, {r_loop}, {extent};")
             emitter.emit(f"    @{p_loop} bra {loop_end};")
 
+            emitter.loop_vars.add(stmt.axis.name)
+            emitter.loop_vars.update(loop_acc_names)
             compile_stmts(stmt.body, emitter, exit_label)
+            emitter.loop_vars.difference_update(loop_acc_names)
+            emitter.loop_vars.discard(stmt.axis.name)
 
             emitter.emit(f"    add.s32 {r_loop}, {r_loop}, 1;")
             emitter.emit(f"    bra {loop_start};")
