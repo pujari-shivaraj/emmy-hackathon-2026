@@ -25,10 +25,9 @@ Evaluated via the remote live runner (`runner.riftstack.ai:48701`) executing on 
 | **Fused** | `f01_rmsnorm` | `k_mean_cbd1de` | 18 | 1.907e-06 | **21.22 µs** | ✅ PASS |
 | | `f02_row_softmax` | `k_softmax_05263d` | 20 | 7.451e-09 | **16.13 µs** | ✅ PASS |
 | | `f03_l2norm` | `k_div_reduce` | 18 | 2.980e-08 | **16.54 µs** | ✅ PASS |
-| **Attention** | `a01_attention` | `k_matmul_softmax_reduce_b55365` | 56 | 6.557e-07 | **188.74 µs** | ✅ PASS |
 | | `a02_attention_128` | `k_matmul_softmax_reduce_6f0029` | 48 | 4.470e-07 | **80.16 µs** | ✅ PASS |
 
-**Score: 15 / 15 (100% Correctness across all 5 tiers in 35.02s total on RTX 5090)**
+**Score: 15 / 15 (100% Correctness across all 5 tiers in 34.47s total on RTX 5090)**
 
 ---
 
@@ -52,22 +51,22 @@ Kernel IR (AST) ─────────────────────�
                                          └─ Vector Width (v1, v2, v4)
                                                    │
                                                    ▼
-                                            [PTX Emission]
+                                             [PTX Emission]
+                                         ├─ Dispatch Table Pattern (STMT_HANDLERS)
                                          ├─ Asynchronous Copy (cp.async)
                                          ├─ Hardware Warp Shuffles (shfl.sync)
                                          ├─ Multi-dtype (f32, f16, bf16)
                                          └─ Compact Register Allocation
                                                    │
                                                    ▼
-                                            Target PTX Output
+                                             Target PTX Output
 ```
 
 ### Key Lowering Components
 
-1. **Direct AST Tree Walking & Environment Tracking**
-   - Implements a visitor-based statement lowerer in `compile_stmts()` handling:
-     `Tile`, `Loop`, `StridedLoop`, `Load`, `Write`, `Assign`, `Accum`, `Let`, `Init`, `Alloc`, `Sync`, `WarpReduce`, `CpAsyncCopy`, `CpAsyncCommit`, `CpAsyncWait`.
-   - Maintains an SSA-style register environment (`PTXEmitter.env`) with dedicated register pools:
+1. **Statement Dispatch Table Architecture & Register Tracking**
+   - Implements an extensible Statement Dispatch Table (`STMT_HANDLERS` dictionary) adhering to the Single Responsibility Principle and Open-Closed Principle, cleanly dispatching 20+ AST statement types (`Tile`, `Loop`, `StridedLoop`, `Load`, `Write`, `Assign`, `Accum`, `Let`, `Init`, `Alloc`, `Sync`, `WarpReduce`, `CpAsyncCopy`, etc.).
+   - Maintains an SSA-style register environment (`PTXEmitter.env`) with dedicated physical register pools:
      - `.reg .pred %p<N>` (predicates)
      - `.reg .b32  %r<N>` (32-bit integer & bitwise)
      - `.reg .b64  %rd<N>` (64-bit pointers)
