@@ -253,9 +253,17 @@ class PTXEmitter:
                 elif op == "-":
                     self.emit(f"    sub.s32 {out_reg}, {left_reg}, {imm};")
                 elif op == "/":
-                    self.emit(f"    div.s32 {out_reg}, {left_reg}, {imm};")
+                    if imm > 0 and (imm & (imm - 1)) == 0 and imm > 1:
+                        shift = imm.bit_length() - 1
+                        self.emit(f"    shr.u32 {out_reg}, {left_reg}, {shift};")
+                    else:
+                        self.emit(f"    div.s32 {out_reg}, {left_reg}, {imm};")
                 elif op == "%":
-                    self.emit(f"    rem.s32 {out_reg}, {left_reg}, {imm};")
+                    if imm > 0 and (imm & (imm - 1)) == 0 and imm > 1:
+                        mask = imm - 1
+                        self.emit(f"    and.b32 {out_reg}, {left_reg}, {mask};")
+                    else:
+                        self.emit(f"    rem.s32 {out_reg}, {left_reg}, {imm};")
                 elif op in ("==", "!=", "<", "<=", ">", ">="):
                     p_reg = self.compile_cond(expr)
                     r_one = self.next_b32()

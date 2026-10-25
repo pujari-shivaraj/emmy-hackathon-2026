@@ -12,23 +12,23 @@ Evaluated via the remote live runner (`runner.riftstack.ai:48701`) executing on 
 
 | Category | Problem | Kernel Name | Registers | Max Abs Error | Kernel Latency | Status |
 |:---|:---|:---|:---:|:---:|:---:|:---:|
-| **Pointwise** | `p00_scalar_add` | `k_add_pointwise` | 16 | 0.000e+00 | **29.28 µs** | ✅ PASS |
-| | `p01_vector_add` | `k_add_pointwise` | 16 | 0.000e+00 | **23.81 µs** | ✅ PASS |
-| | `p02_scale_shift` | `k_add_pointwise` | 16 | 0.000e+00 | **24.58 µs** | ✅ PASS |
-| | `p03_relu_mul` | `k_mul_pointwise` | 16 | 0.000e+00 | **16.80 µs** | ✅ PASS |
-| **Reduction** | `r01_array_sum` | `k_sum_1_reduce` | 24 | 3.815e-06 | **23.17 µs** | ✅ PASS |
-| | `r02_big_sum` | `k_sum_1_reduce` | 24 | 1.526e-05 | **42.34 µs** | ✅ PASS |
-| | `r03_mean` | `k_mean_ffcca3` | 16 | 9.313e-10 | **31.26 µs** | ✅ PASS |
-| | `r04_row_sum` | `k_sum_1_reduce` | 24 | 5.722e-06 | **23.94 µs** | ✅ PASS |
-| **Matmul** | `m01_matmul_512` | `k_matmul_2967be` | 36 | 8.392e-05 | **112.51 µs** | ✅ PASS |
-| | `m02_matmul_rect` | `k_matmul` | 28 | 1.144e-05 | **16.58 µs** | ✅ PASS |
-| **Fused** | `f01_rmsnorm` | `k_mean_cbd1de` | 18 | 1.907e-06 | **16.22 µs** | ✅ PASS |
-| | `f02_row_softmax` | `k_softmax_05263d` | 20 | 7.451e-09 | **17.15 µs** | ✅ PASS |
-| | `f03_l2norm` | `k_div_reduce` | 18 | 2.980e-08 | **15.94 µs** | ✅ PASS |
-| **Attention** | `a01_attention` | `k_matmul_softmax_reduce_b55365` | 56 | 6.557e-07 | **213.15 µs** | ✅ PASS |
-| | `a02_attention_128` | `k_matmul_softmax_reduce_6f0029` | 48 | 4.470e-07 | **95.68 µs** | ✅ PASS |
+| **Pointwise** | `p00_scalar_add` | `k_add_pointwise` | 16 | 0.000e+00 | **23.20 µs** | ✅ PASS |
+| | `p01_vector_add` | `k_add_pointwise` | 16 | 0.000e+00 | **43.07 µs** | ✅ PASS |
+| | `p02_scale_shift` | `k_add_pointwise` | 16 | 0.000e+00 | **16.03 µs** | ✅ PASS |
+| | `p03_relu_mul` | `k_mul_pointwise` | 16 | 0.000e+00 | **16.38 µs** | ✅ PASS |
+| **Reduction** | `r01_array_sum` | `k_sum_1_reduce` | 24 | 3.815e-06 | **23.36 µs** | ✅ PASS |
+| | `r02_big_sum` | `k_sum_1_reduce` | 24 | 1.526e-05 | **44.06 µs** | ✅ PASS |
+| | `r03_mean` | `k_mean_ffcca3` | 16 | 9.313e-10 | **31.94 µs** | ✅ PASS |
+| | `r04_row_sum` | `k_sum_1_reduce` | 24 | 5.722e-06 | **23.87 µs** | ✅ PASS |
+| **Matmul** | `m01_matmul_512` | `k_matmul_2967be` | 30 | 8.392e-05 | **50.27 µs** | ✅ PASS |
+| | `m02_matmul_rect` | `k_matmul` | 28 | 1.526e-05 | **15.04 µs** | ✅ PASS |
+| **Fused** | `f01_rmsnorm` | `k_mean_cbd1de` | 18 | 1.907e-06 | **16.38 µs** | ✅ PASS |
+| | `f02_row_softmax` | `k_softmax_05263d` | 20 | 7.451e-09 | **15.94 µs** | ✅ PASS |
+| | `f03_l2norm` | `k_div_reduce` | 18 | 2.980e-08 | **16.93 µs** | ✅ PASS |
+| **Attention** | `a01_attention` | `k_matmul_softmax_reduce_b55365` | 56 | 6.557e-07 | **212.61 µs** | ✅ PASS |
+| | `a02_attention_128` | `k_matmul_softmax_reduce_6f0029` | 48 | 4.470e-07 | **97.18 µs** | ✅ PASS |
 
-**Score: 15 / 15 (100% Correctness across all 5 tiers in 51.47s total on RTX 5090)**
+**Score: 15 / 15 (100% Correctness across all 5 tiers in 43.69s total on RTX 5090)**
 
 ---
 
