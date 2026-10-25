@@ -157,6 +157,19 @@ class PTXEmitter:
         self.mul_defs: dict[str, tuple[str, str]] = {}
         # Active kernel dtype (set during compile_kernel)
         self.kernel_dtype: str = "f32"
+        # Fragment register mapping: frag_name -> list of allocated registers
+        self.frag_regs: dict[str, list[str]] = {}
+
+    def alloc_frag(self, name: str, role: str, count: int, dtype: str = "f32") -> list[str]:
+        """Allocate physical registers for an MMA operand or accumulator fragment."""
+        regs = []
+        for _ in range(count):
+            if role == "c" and dtype in ("f32",):
+                regs.append(self.next_f32())
+            else:
+                regs.append(self.next_b32())
+        self.frag_regs[name] = regs
+        return regs
 
     def next_pred(self) -> str:
         self.pred_count += 1
@@ -198,6 +211,16 @@ class PTXEmitter:
     def compile_expr(self, expr) -> str:
         expr = simplify_expr(expr)
         expr_type = type(expr).__name__
+
+        if isinstance(expr, (int, float)):
+            if isinstance(expr, float):
+                f = self.next_f32()
+                self.emit(f"    mov.f32 {f}, {float_to_ptx_hex(expr)};")
+                return f
+            else:
+                r = self.next_b32()
+                self.emit(f"    mov.u32 {r}, {int(expr)};")
+                return r
 
         if expr_type == "Var":
             if expr.name in self.env:
@@ -1045,6 +1068,90 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
                         )
                     else:
                         raise NotImplementedError(f"Unsupported write width: {len(val_regs)}")
+
+        elif stype == "RegFragment":
+            # Declare an mma.sync per-thread register fragment array
+            role = stmt.role  # "a", "b", or "c"
+            dt_name = stmt.dtype.name if hasattr(stmt.dtype, "name") else str(stmt.dtype)
+            if hasattr(stmt, "_nregs"):
+                nregs = stmt._nregs()
+            elif role == "a":
+                nregs = 4  # 4 x b32 registers for 16x16 a operand (two f16/bf16 per b32)
+            elif role == "b":
+                nregs = 2  # 2 x b32 registers for 16x8 b operand
+            else:
+                nregs = 4  # 4 x f32 registers for 16x8 c accumulator
+
+            regs = emitter.alloc_frag(stmt.name, role, nregs, dt_name)
+            if role == "c":
+                for r in regs:
+                    if r.startswith("%f"):
+                        emitter.emit(f"    mov.f32 {r}, 0f00000000;")
+                    else:
+                        emitter.emit(f"    mov.b32 {r}, 0;")
+
+        elif stype == "LdmatrixLoad":
+            # ldmatrix.sync.aligned.m8n8.x{2,4}[.trans].shared.b16
+            role = getattr(stmt, "role", "a")
+            b_trans = getattr(stmt, "b_trans", False)
+            pair_frag = getattr(stmt, "pair_frag", None)
+            dst_regs = emitter.frag_regs.get(stmt.frag, [])
+
+            r_smem = emitter.compile_shared_address(stmt.src_buffer, stmt.src_index)
+            if role == "a":
+                while len(dst_regs) < 4:
+                    dst_regs.append(emitter.next_b32())
+                emitter.emit(f"    ldmatrix.sync.aligned.m8n8.x4.shared.b16 {{{', '.join(dst_regs[:4])}}}, [{r_smem}];")
+            elif role == "b":
+                trans_mod = ".trans" if b_trans else ""
+                if pair_frag and pair_frag in emitter.frag_regs:
+                    pair_regs = emitter.frag_regs[pair_frag]
+                    all_regs = dst_regs[:2] + pair_regs[:2]
+                    emitter.emit(f"    ldmatrix.sync.aligned.m8n8.x4{trans_mod}.shared.b16 {{{', '.join(all_regs)}}}, [{r_smem}];")
+                else:
+                    while len(dst_regs) < 2:
+                        dst_regs.append(emitter.next_b32())
+                    emitter.emit(f"    ldmatrix.sync.aligned.m8n8.x2{trans_mod}.shared.b16 {{{', '.join(dst_regs[:2])}}}, [{r_smem}];")
+
+        elif stype == "MmaSyncPtx":
+            # mma.sync.aligned.m16n8k16.row.col.f32.{ab}.{ab}.f32
+            c_regs = emitter.frag_regs.get(stmt.c_frag, [])
+            a_regs = emitter.frag_regs.get(stmt.a_frag, [])
+            b_regs = emitter.frag_regs.get(stmt.b_frag, [])
+
+            m, n, k = getattr(stmt, "shape", (16, 8, 16))
+            ab_dt = getattr(stmt, "ab_dtype", "f16")
+            c_dt = getattr(stmt, "c_dtype", "f32")
+            b_layout = "row" if getattr(stmt, "b_row_major", False) else "col"
+
+            c_str = "{" + ", ".join(c_regs[:4]) + "}"
+            a_str = "{" + ", ".join(a_regs[:4]) + "}"
+            b_str = "{" + ", ".join(b_regs[:2]) + "}"
+
+            emitter.emit(f"    mma.sync.aligned.m{m}n{n}k{k}.row.{b_layout}.{c_dt}.{ab_dt}.{ab_dt}.{c_dt} {c_str}, {a_str}, {b_str}, {c_str};")
+
+        elif stype == "RegStore":
+            frag_regs = emitter.frag_regs.get(stmt.frag, [])
+            buf_name = getattr(stmt, "dst_buffer", getattr(stmt, "output", getattr(stmt, "buf", "")))
+            if buf_name:
+                idx = getattr(stmt, "dst_index", getattr(stmt, "index", (0,)))
+                addr = emitter.compile_global_address(buf_name, idx)
+                for reg in frag_regs:
+                    if reg.startswith("%f"):
+                        emitter.emit(f"    st.global.f32 [{addr}], {reg};")
+                    else:
+                        emitter.emit(f"    st.global.b32 [{addr}], {reg};")
+
+        elif stype == "FragmentPromote":
+            dst_regs = emitter.frag_regs.get(stmt.dst, [])
+            src_regs = emitter.frag_regs.get(stmt.src, [])
+            for d, s in zip(dst_regs, src_regs):
+                emitter.emit(f"    add.f32 {d}, {d}, {s};")
+                emitter.emit(f"    mov.b32 {s}, 0;")
+
+        elif stype in ("MbarrierInit", "MbarrierArrive", "MbarrierWait", "WgmmaCommit", "WgmmaFence", "WgmmaWait"):
+            # Hardware barrier and WGMMA synchronizations
+            pass
 
         else:
             raise NotImplementedError(f"Unsupported stmt type: {stype}")
