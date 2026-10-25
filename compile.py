@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import struct
 import sys
 from pathlib import Path
@@ -122,10 +121,6 @@ def simplify_expr(expr):
             if is_lit(right, 1):
                 return left
 
-        # Commutative canonicalization: put constants on the right
-        if op in ("+", "*") and is_lit(left) and not is_lit(right):
-            left, right = right, left
-
         return BinaryExprWrapper(op, left, right)
 
     if etype == "TernaryExpr":
@@ -171,37 +166,6 @@ def expr_key(expr) -> str:
     return str(expr)
 
 
-class Environment(dict):
-    """Environment mapping variable names to physical PTX registers.
-    Materializes deferred/pending instructions (such as unused multiplies) on demand.
-    """
-    def __init__(self, emitter):
-        super().__init__()
-        self.emitter = emitter
-
-    def _resolve(self, key):
-        if hasattr(self, "emitter") and self.emitter and key in self.emitter.aliases:
-            key = self.emitter.aliases[key]
-            while key in self.emitter.aliases:
-                key = self.emitter.aliases[key]
-        return key
-
-    def __getitem__(self, key):
-        key = self._resolve(key)
-        if hasattr(self, "emitter") and self.emitter and key in self.emitter.pending_muls:
-            dt_name, a0, a1 = self.emitter.pending_muls.pop(key)
-            is_f16 = dt_name in ("f16", "bf16")
-            reg = self.emitter.next_f16() if is_f16 else self.emitter.next_f32()
-            self.emitter.emit(f"    mul.{dt_name} {reg}, {a0}, {a1};")
-            super().__setitem__(key, reg)
-            return reg
-        return super().__getitem__(key)
-
-    def __contains__(self, key):
-        key = self._resolve(key)
-        return super().__contains__(key) or (hasattr(self, "emitter") and self.emitter and key in self.emitter.pending_muls)
-
-
 class PTXEmitter:
     def __init__(self):
         self.pred_count = 0
@@ -212,7 +176,7 @@ class PTXEmitter:
         self.label_count = 0
         self.lines: list[str] = []
         # SSA name -> register name
-        self.env: dict[str, str] = Environment(self)
+        self.env: dict[str, str] = {}
         # Buffer name -> 64-bit base register name
         self.buf_ptrs: dict[str, str] = {}
         # Shape info: buffer name -> list of int
@@ -225,12 +189,6 @@ class PTXEmitter:
         self.init_names: set[str] = set()
         # FMA tracking: mul_name -> (arg0_reg, arg1_reg)
         self.mul_defs: dict[str, tuple[str, str]] = {}
-        # Pending multiply definitions for dead FMA pruning: mul_name -> (dt_name, arg0_reg, arg1_reg)
-        self.pending_muls: dict[str, tuple[str, str, str]] = {}
-        # AST use counts: var_name -> count of appearances in AST
-        self.use_counts: dict[str, int] = {}
-        # Statement congruence aliases: redundant_name -> canonical_name
-        self.aliases: dict[str, str] = {}
         # Active kernel dtype (set during compile_kernel)
         self.kernel_dtype: str = "f32"
         # Fragment register mapping: frag_name -> list of allocated registers
@@ -294,7 +252,8 @@ class PTXEmitter:
 
         # Pass 6: Loop-Invariant Common Subexpression Elimination (CSE)
         is_composite = expr_type in ("BinaryExpr", "BinaryExprWrapper", "TernaryExpr")
-        if is_composite:
+        free = expr_free_vars(expr) if is_composite else None
+        if is_composite and not (free & self.loop_vars):
             key = expr_key(expr)
             if key in self.expr_cache:
                 return self.expr_cache[key]
@@ -360,8 +319,6 @@ class PTXEmitter:
                     self.emit(f"    selp.b32 {out_reg}, {r_one}, {r_zero}, {p_reg};")
                 else:
                     raise NotImplementedError(f"Unsupported binary expr op: {op}")
-                if is_composite and not self.loop_vars:
-                    self.expr_cache[key] = out_reg
                 return out_reg
 
             left_reg = self.compile_expr(expr.left)
@@ -385,7 +342,7 @@ class PTXEmitter:
                 self.emit(f"    selp.b32 {out_reg}, {r_one}, {r_zero}, {p_reg};")
             else:
                 raise NotImplementedError(f"Unsupported binary expr op: {op}")
-            if is_composite and not self.loop_vars:
+            if is_composite and not (free & self.loop_vars):
                 self.expr_cache[key] = out_reg
             return out_reg
 
@@ -395,7 +352,7 @@ class PTXEmitter:
             r_false = self.compile_expr(expr.if_false)
             out_reg = self.next_b32()
             self.emit(f"    selp.b32 {out_reg}, {r_true}, {r_false}, {p_cond};")
-            if is_composite and not self.loop_vars:
+            if is_composite and not (free & self.loop_vars):
                 self.expr_cache[key] = out_reg
             return out_reg
 
@@ -554,116 +511,6 @@ def find_smem_decls(stmts) -> list[tuple[str, int, int, list[int]]]:
     return res
 
 
-def count_ast_uses(stmts) -> dict[str, int]:
-    """Count how many times each SSA variable name is consumed across the AST."""
-    counts: dict[str, int] = {}
-
-    def inc(name: str):
-        if name:
-            counts[name] = counts.get(name, 0) + 1
-
-    def count_expr(e):
-        if e is None:
-            return
-        et = type(e).__name__
-        if et == "Var":
-            inc(e.name)
-        elif et in ("BinaryExpr", "BinaryExprWrapper"):
-            count_expr(e.left)
-            count_expr(e.right)
-        elif et == "TernaryExpr":
-            count_expr(e.cond)
-            count_expr(e.if_true)
-            count_expr(e.if_false)
-
-    def walk(s):
-        st = type(s).__name__
-        if st == "Assign":
-            for a in s.args:
-                inc(a)
-        elif st == "Accum":
-            inc(s.value)
-            if getattr(s, "base", None):
-                inc(s.base)
-        elif st == "Write":
-            for v in getattr(s, "values", []):
-                inc(v)
-            for idx in getattr(s, "index", []):
-                count_expr(idx)
-        elif st == "Load":
-            for idx in getattr(s, "index", []):
-                count_expr(idx)
-        elif st == "Let":
-            count_expr(getattr(s, "value", None))
-        elif st == "If":
-            count_expr(getattr(s, "cond", None))
-            for b in getattr(s, "then_body", []):
-                walk(b)
-            for b in getattr(s, "else_body", []):
-                walk(b)
-        elif st in ("Loop", "StridedLoop", "Tile"):
-            for b in getattr(s, "body", []):
-                walk(b)
-
-    for s in stmts:
-        walk(s)
-    return counts
-
-
-def compute_statement_aliases(stmts) -> dict[str, str]:
-    """Pass 7: Statement Congruence Closure / Local Value Numbering.
-    Finds redundant duplicate statements (such as unrolled column softmax scalar states)
-    and maps duplicate variable names to their already-computed canonical counterparts.
-    """
-    aliases: dict[str, str] = {}
-
-    def canonical(n: str) -> str:
-        while n in aliases:
-            n = aliases[n]
-        return n
-
-    while True:
-        prev_len = len(aliases)
-        val_table = {}
-
-        def scan(s_list):
-            for s in s_list:
-                st = type(s).__name__
-                if st == "Assign":
-                    c_args = tuple(canonical(a) for a in s.args)
-                    key = (s.op.name, c_args)
-                    if key in val_table:
-                        aliases[s.name] = val_table[key]
-                    else:
-                        val_table[key] = s.name
-                elif st == "Let":
-                    if hasattr(s, "value") and hasattr(s.value, "value"):
-                        key = ("Literal", s.value.value)
-                        if key in val_table:
-                            aliases[s.name] = val_table[key]
-                        else:
-                            val_table[key] = s.name
-                elif st == "Accum":
-                    c_val = canonical(s.value)
-                    c_base = canonical(s.base) if getattr(s, "base", None) else None
-                    key = (s.op.name, c_val, c_base)
-                    if key in val_table:
-                        aliases[s.name] = val_table[key]
-                    else:
-                        val_table[key] = s.name
-                elif st in ("Loop", "StridedLoop", "Tile"):
-                    scan(getattr(s, "body", []))
-                elif st == "If":
-                    scan(getattr(s, "then_body", []))
-                    scan(getattr(s, "else_body", []))
-
-        scan(stmts)
-        if len(aliases) == prev_len:
-            break
-
-    return aliases
-
-
 def compile_kernel(ir_path: Path) -> str:
     with open(ir_path) as f:
         data = json.load(f)
@@ -754,8 +601,6 @@ def compile_kernel(ir_path: Path) -> str:
     body_emitter.buf_shapes = emitter.buf_shapes
     body_emitter.smem_names = emitter.smem_names
     body_emitter.smem_bases = {}
-    body_emitter.use_counts = count_ast_uses(kop.body)
-    body_emitter.aliases = {}
 
     if use_dynamic_smem:
         r_pool = body_emitter.next_b32()
@@ -816,24 +661,13 @@ def compile_kernel(ir_path: Path) -> str:
 
             for i, a in enumerate(stmt.axes):
                 r_div = body_emitter.next_b32()
-                stride_val = strides[i]
-                if stride_val != 1:
-                    if stride_val > 0 and (stride_val & (stride_val - 1)) == 0:
-                        shift = stride_val.bit_length() - 1
-                        body_emitter.emit(f"    shr.u32 {r_div}, {r_gid}, {shift};")
-                    else:
-                        body_emitter.emit(f"    div.s32 {r_div}, {r_gid}, {stride_val};")
+                if strides[i] != 1:
+                    body_emitter.emit(f"    div.s32 {r_div}, {r_gid}, {strides[i]};")
                 else:
                     r_div = r_gid
-
-                extent_val = extents[i]
                 if i > 0:
                     r_rem = body_emitter.next_b32()
-                    if extent_val > 0 and (extent_val & (extent_val - 1)) == 0:
-                        mask = extent_val - 1
-                        body_emitter.emit(f"    and.b32 {r_rem}, {r_div}, {mask};")
-                    else:
-                        body_emitter.emit(f"    rem.s32 {r_rem}, {r_div}, {extent_val};")
+                    body_emitter.emit(f"    rem.s32 {r_rem}, {r_div}, {extents[i]};")
                     body_emitter.env[a.name] = r_rem
                 else:
                     body_emitter.env[a.name] = r_div
@@ -865,7 +699,6 @@ def find_axis_accums(axis_name: str, stmts, emitter: PTXEmitter) -> list:
                 hasattr(s, "axes")
                 and axis_name in s.axes
                 and s.name not in emitter.init_names
-                and s.name not in emitter.aliases
             ):
                 res.append(s)
         if hasattr(s, "body"):
@@ -953,111 +786,96 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
                     raise NotImplementedError(f"Vector load width {stmt.width} not implemented yet")
 
         # ======================================================================
-        # PASS 4: FMA (Fused Multiply-Add) Pattern Matching & Dead Mul Pruning
+        # PASS 4: FMA (Fused Multiply-Add) Pattern Matching
         # ======================================================================
         elif stype == "Assign":
             op_name = stmt.op.name
+            args = [emitter.env[a] for a in stmt.args]
             dt = getattr(stmt, "dtype", None)
             dt_name = dt.name if hasattr(dt, "name") else "f32"
             is_f16_like = dt_name in ("f16", "bf16")
+            out_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
 
             if op_name == "multiply":
-                args = [emitter.env[a] for a in stmt.args]
                 emitter.mul_defs[stmt.name] = (args[0], args[1])
-                # Optimization 1: Dead FMA Multiply Pruning
-                # If this multiply has exactly 1 use in the AST, defer standalone mul emission
-                if emitter.use_counts.get(stmt.name, 0) == 1:
-                    emitter.pending_muls[stmt.name] = (dt_name, args[0], args[1])
-                    continue
-                out_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
                 emitter.emit(f"    mul.{dt_name} {out_reg}, {args[0]}, {args[1]};")
-            else:
-                out_reg = emitter.next_f16() if is_f16_like else emitter.next_f32()
-                if op_name == "add":
-                    # FMA fusion: check if either operand is an in-flight multiply
-                    a0_canon = emitter.aliases.get(stmt.args[0], stmt.args[0])
-                    a1_canon = emitter.aliases.get(stmt.args[1], stmt.args[1])
-                    if a0_canon in emitter.mul_defs:
-                        ma, mb = emitter.mul_defs[a0_canon]
-                        emitter.pending_muls.pop(a0_canon, None)
-                        other_reg = emitter.env[stmt.args[1]]
-                        fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
-                        emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {other_reg};")
-                    elif a1_canon in emitter.mul_defs:
-                        ma, mb = emitter.mul_defs[a1_canon]
-                        emitter.pending_muls.pop(a1_canon, None)
-                        other_reg = emitter.env[stmt.args[0]]
-                        fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
-                        emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {other_reg};")
-                    else:
-                        args = [emitter.env[a] for a in stmt.args]
-                        emitter.emit(f"    add.{dt_name} {out_reg}, {args[0]}, {args[1]};")
+            elif op_name == "add":
+                # FMA fusion: check if either operand is an in-flight multiply
+                if stmt.args[0] in emitter.mul_defs:
+                    ma, mb = emitter.mul_defs[stmt.args[0]]
+                    fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
+                    emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {args[1]};")
+                elif stmt.args[1] in emitter.mul_defs:
+                    ma, mb = emitter.mul_defs[stmt.args[1]]
+                    fma_op = "fma.rn" if dt_name == "f32" else f"fma.rn"
+                    emitter.emit(f"    {fma_op}.{dt_name} {out_reg}, {ma}, {mb}, {args[0]};")
                 else:
-                    args = [emitter.env[a] for a in stmt.args]
-                    if op_name == "divide":
-                        if is_f16_like:
-                            # f16/bf16 has no native div; promote to f32, divide, convert back
-                            f_a = emitter.next_f32()
-                            f_b = emitter.next_f32()
-                            f_r = emitter.next_f32()
-                            emitter.emit(f"    cvt.f32.{dt_name} {f_a}, {args[0]};")
-                            emitter.emit(f"    cvt.f32.{dt_name} {f_b}, {args[1]};")
-                            emitter.emit(f"    div.rn.f32 {f_r}, {f_a}, {f_b};")
-                            emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_r};")
-                        else:
-                            emitter.emit(f"    div.rn.f32 {out_reg}, {args[0]}, {args[1]};")
-                    elif op_name == "relu":
-                        if is_f16_like:
-                            zero_h = emitter.next_f16()
-                            f_zero = emitter.next_f32()
-                            emitter.emit(f"    mov.f32 {f_zero}, 0f00000000;")
-                            emitter.emit(f"    cvt.rn.{dt_name}.f32 {zero_h}, {f_zero};")
-                            emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {zero_h};")
-                        else:
-                            emitter.emit(f"    max.f32 {out_reg}, {args[0]}, 0f00000000;")
-                    elif op_name == "maximum":
-                        emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {args[1]};")
-                    elif op_name in ("sub", "subtract"):
-                        emitter.emit(f"    sub.{dt_name} {out_reg}, {args[0]}, {args[1]};")
-                    elif op_name == "reciprocal":
-                        if is_f16_like:
-                            f_in = emitter.next_f32()
-                            f_rcp = emitter.next_f32()
-                            emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
-                            emitter.emit(f"    rcp.approx.f32 {f_rcp}, {f_in};")
-                            emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_rcp};")
-                        else:
-                            emitter.emit(f"    rcp.approx.f32 {out_reg}, {args[0]};")
-                    elif op_name == "sqrt":
-                        if is_f16_like:
-                            f_in = emitter.next_f32()
-                            f_sq = emitter.next_f32()
-                            emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
-                            emitter.emit(f"    sqrt.approx.f32 {f_sq}, {f_in};")
-                            emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_sq};")
-                        else:
-                            emitter.emit(f"    sqrt.approx.f32 {out_reg}, {args[0]};")
-                    elif op_name == "exp":
-                        # ex2 only exists for f32; promote f16->f32, compute, convert back
-                        if is_f16_like:
-                            f_in = emitter.next_f32()
-                            f_scaled = emitter.next_f32()
-                            f_out = emitter.next_f32()
-                            emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
-                            emitter.emit(f"    mul.f32 {f_scaled}, {f_in}, 0f3fb8aa3b;")
-                            emitter.emit(f"    ex2.approx.f32 {f_out}, {f_scaled};")
-                            emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_out};")
-                        else:
-                            f_scaled = emitter.next_f32()
-                            emitter.emit(f"    mul.f32 {f_scaled}, {args[0]}, 0f3fb8aa3b;")
-                            emitter.emit(f"    ex2.approx.f32 {out_reg}, {f_scaled};")
-                    elif op_name == "copy":
-                        emitter.emit(f"    mov.b16 {out_reg}, {args[0]};" if is_f16_like else f"    mov.f32 {out_reg}, {args[0]};")
-                    else:
-                        raise NotImplementedError(f"Unsupported assign op: {op_name}")
+                    emitter.emit(f"    add.{dt_name} {out_reg}, {args[0]}, {args[1]};")
+            elif op_name == "divide":
+                if is_f16_like:
+                    # f16/bf16 has no native div; promote to f32, divide, convert back
+                    f_a = emitter.next_f32()
+                    f_b = emitter.next_f32()
+                    f_r = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_a}, {args[0]};")
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_b}, {args[1]};")
+                    emitter.emit(f"    div.rn.f32 {f_r}, {f_a}, {f_b};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_r};")
+                else:
+                    emitter.emit(f"    div.rn.f32 {out_reg}, {args[0]}, {args[1]};")
+            elif op_name == "relu":
+                if is_f16_like:
+                    zero_h = emitter.next_f16()
+                    f_zero = emitter.next_f32()
+                    emitter.emit(f"    mov.f32 {f_zero}, 0f00000000;")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {zero_h}, {f_zero};")
+                    emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {zero_h};")
+                else:
+                    emitter.emit(f"    max.f32 {out_reg}, {args[0]}, 0f00000000;")
+            elif op_name == "maximum":
+                emitter.emit(f"    max.{dt_name} {out_reg}, {args[0]}, {args[1]};")
+            elif op_name in ("sub", "subtract"):
+                emitter.emit(f"    sub.{dt_name} {out_reg}, {args[0]}, {args[1]};")
+            elif op_name == "reciprocal":
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_rcp = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    rcp.approx.f32 {f_rcp}, {f_in};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_rcp};")
+                else:
+                    emitter.emit(f"    rcp.approx.f32 {out_reg}, {args[0]};")
+            elif op_name == "sqrt":
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_sq = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    sqrt.approx.f32 {f_sq}, {f_in};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_sq};")
+                else:
+                    emitter.emit(f"    sqrt.approx.f32 {out_reg}, {args[0]};")
+            elif op_name == "exp":
+                # ex2 only exists for f32; promote f16->f32, compute, convert back
+                if is_f16_like:
+                    f_in = emitter.next_f32()
+                    f_scaled = emitter.next_f32()
+                    f_out = emitter.next_f32()
+                    emitter.emit(f"    cvt.f32.{dt_name} {f_in}, {args[0]};")
+                    emitter.emit(f"    mul.f32 {f_scaled}, {f_in}, 0f3fb8aa3b;")
+                    emitter.emit(f"    ex2.approx.f32 {f_out}, {f_scaled};")
+                    emitter.emit(f"    cvt.rn.{dt_name}.f32 {out_reg}, {f_out};")
+                else:
+                    f_scaled = emitter.next_f32()
+                    emitter.emit(f"    mul.f32 {f_scaled}, {args[0]}, 0f3fb8aa3b;")
+                    emitter.emit(f"    ex2.approx.f32 {out_reg}, {f_scaled};")
+            elif op_name == "copy":
+                emitter.emit(f"    mov.b16 {out_reg}, {args[0]};" if is_f16_like else f"    mov.f32 {out_reg}, {args[0]};")
+            else:
+                raise NotImplementedError(f"Unsupported assign op: {op_name}")
             emitter.env[stmt.name] = out_reg
 
         elif stype == "Accum":
+            val_reg = emitter.env[stmt.value]
             acc_name = stmt.name
             dt = getattr(stmt, "dtype", None)
             dt_name = dt.name if hasattr(dt, "name") else "f32"
@@ -1077,21 +895,18 @@ def compile_stmts(stmts, emitter: PTXEmitter, exit_label: str):
                 acc_reg = emitter.env[acc_name]
 
             lhs = emitter.env[stmt.base] if stmt.base is not None else acc_reg
+            rhs = val_reg
 
             op_name = stmt.op.name
             if op_name == "add":
                 # FMA Fusion into accumulator!
-                val_canon = emitter.aliases.get(stmt.value, stmt.value)
-                if val_canon in emitter.mul_defs:
-                    ma, mb = emitter.mul_defs[val_canon]
-                    emitter.pending_muls.pop(val_canon, None)
+                if stmt.value in emitter.mul_defs:
+                    ma, mb = emitter.mul_defs[stmt.value]
                     emitter.emit(f"    fma.rn.{dt_name} {acc_reg}, {ma}, {mb}, {lhs};")
                 else:
-                    val_reg = emitter.env[stmt.value]
-                    emitter.emit(f"    add.{dt_name} {acc_reg}, {lhs}, {val_reg};")
+                    emitter.emit(f"    add.{dt_name} {acc_reg}, {lhs}, {rhs};")
             elif op_name == "maximum":
-                val_reg = emitter.env[stmt.value]
-                emitter.emit(f"    max.{dt_name} {acc_reg}, {lhs}, {val_reg};")
+                emitter.emit(f"    max.{dt_name} {acc_reg}, {lhs}, {rhs};")
             else:
                 raise NotImplementedError(f"Unsupported accum op: {op_name}")
 
